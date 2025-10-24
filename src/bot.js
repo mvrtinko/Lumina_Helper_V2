@@ -232,10 +232,8 @@ async function schedulerTick() {
 
     const fired = async (kind) => !!(await get(`SELECT 1 FROM shift_events WHERE shift_id=? AND kind=?`, [s.id, kind]));
     const mark  = async (kind) => markShiftEvent(s.id, kind, DateTime.now().toISO());
-    const alreadyClocked = await hasClockedIn(s.id);
-
     if (now >= remindAt && !(await fired('remind'))) {
-      if (!alreadyClocked) {
+      if (!(await hasClockedIn(s.id))) {
         try {
           const ch = await client.channels.fetch(s.channel_id);
           await ch.send(`<@${s.user_id}> shift for **${s.model || 'your model'}** starts in 15 minutes. Please /clockin.`);
@@ -245,7 +243,7 @@ async function schedulerTick() {
     }
 
     if (now >= startAt && !(await fired('start'))) {
-      if (!alreadyClocked) {
+      if (!(await hasClockedIn(s.id))) {
         try {
           const ch = await client.channels.fetch(s.channel_id);
           await ch.send(`⏰ <@${s.user_id}> your shift **${s.model || ''}** starts NOW. Please /clockin.`);
@@ -435,6 +433,82 @@ function parseSchedulerCustomId(customId) {
   const action = actionPart.replace('scheduler-', '');
   return { action, sessionKey };
 }
+async function handleSchedulerSelect(interaction) {
+  const parsed = parseSchedulerCustomId(interaction.customId);
+  if (!parsed) return;
+  const session = schedulerSessions.get(parsed.sessionKey);
+  if (!session) {
+    await interaction.reply({ content: 'That scheduler session expired. Run `/schedule_shift` again.', ephemeral: true });
+    return;
+  }
+  if (session.ownerId !== interaction.user.id) {
+    await interaction.reply({ content: 'This scheduler belongs to another admin.', ephemeral: true });
+    return;
+  }
+
+  const value = interaction.values?.[0];
+  if (parsed.action === 'date') session.date = value;
+  if (parsed.action === 'hour') session.hour = Number(value);
+  if (parsed.action === 'minute') session.minute = Number(value);
+  if (parsed.action === 'duration') session.durationMinutes = Number(value);
+  schedulerSessions.set(parsed.sessionKey, session);
+  await interaction.update(buildSchedulerMessage(parsed.sessionKey, session));
+}
+async function handleSchedulerButton(interaction) {
+  const parsed = parseSchedulerCustomId(interaction.customId);
+  if (!parsed) return;
+  const session = schedulerSessions.get(parsed.sessionKey);
+  if (!session) {
+    await interaction.reply({ content: 'That scheduler session expired. Run `/schedule_shift` again.', ephemeral: true });
+    return;
+  }
+  if (session.ownerId !== interaction.user.id) {
+    await interaction.reply({ content: 'This scheduler belongs to another admin.', ephemeral: true });
+    return;
+  }
+  if (parsed.action !== 'confirm') return;
+
+  if (session.hour === null || session.minute === null || !session.date) {
+    await interaction.reply({ content: 'Please pick a date, hour, and minutes before creating the shift.', ephemeral: true });
+    return;
+  }
+
+  const start = DateTime.fromISO(`${session.date}T00:00`, { zone: DEFAULT_TZ })
+    .set({ hour: session.hour, minute: session.minute, second: 0, millisecond: 0 });
+  const end = start.plus({ minutes: session.durationMinutes || 60 });
+  const tz = DEFAULT_TZ;
+
+  let voiceChannelId = session.voiceChannelId;
+  let model = session.model;
+  if (!voiceChannelId || !model) {
+    const { voiceChannelId: derivedVoice, modelName: derivedModel } =
+      await findVoiceAndModelForTextChannel(session.channelId, model || 'Model');
+    if (!voiceChannelId && derivedVoice) voiceChannelId = derivedVoice;
+    if (!model && derivedModel) model = derivedModel;
+  }
+
+  const shiftId = await insertShift({
+    guildId: GUILD_ID,
+    userId: session.userId,
+    channelId: session.channelId,
+    startISO: start.toISO(),
+    endISO: end.toISO(),
+    tz,
+    model,
+    voiceChannelId,
+  });
+
+  schedulerSessions.delete(parsed.sessionKey);
+  updateScheduleBoard().catch((e) => log.warn({ e }, 'schedule board refresh failed'));
+
+  await interaction.update({
+    content:
+      `Shift #${shiftId} created for <@${session.userId}> in <#${session.channelId}>.\n` +
+      `${start.toFormat('yyyy-LL-dd HH:mm')} → ${end.toFormat('HH:mm')} (${tz})` +
+      (model ? ` • Model: ${model}` : ''),
+    components: [],
+  });
+}
 
 // ───────── Slash commands ─────────
 const commands = [
@@ -529,6 +603,14 @@ client.once('ready', async () => {
 
 // ───────── Interactions ─────────
 client.on('interactionCreate', async (i) => {
+  if (i.isStringSelectMenu() && i.customId.startsWith('scheduler-')) {
+    await handleSchedulerSelect(i);
+    return;
+  }
+  if (i.isButton() && i.customId.startsWith('scheduler-')) {
+    await handleSchedulerButton(i);
+    return;
+  }
   if (!i.isChatInputCommand()) return;
   const name = i.commandName;
 
@@ -549,6 +631,33 @@ client.on('interactionCreate', async (i) => {
     const ch = i.options.getChannel('channel', true);
     await Settings.setLogsChannelId(ch.id);
     return i.reply({ content: `Shift logs channel set to <#${ch.id}>.`, ephemeral: true });
+  }
+  if (name === 'schedule_shift') {
+    if (!i.memberPermissions?.has(PermissionFlagsBits.Administrator))
+      return i.reply({ content: 'Admins only.', ephemeral: true });
+    const worker = i.options.getUser('user', true);
+    const channel = i.options.getChannel('channel', true);
+    if (!channel?.isTextBased?.())
+      return i.reply({ content: 'Please pick a text-based channel for the shift.', ephemeral: true });
+    const voice = i.options.getChannel('voice_channel');
+    if (voice && ![2, 13].includes(voice.type))
+      return i.reply({ content: 'Voice channel must be a voice or stage channel.', ephemeral: true });
+    const model = i.options.getString('model');
+    const sessionKey = createSchedulerSessionKey();
+    const session = {
+      ownerId: i.user.id,
+      userId: worker.id,
+      channelId: channel.id,
+      voiceChannelId: voice?.id ?? null,
+      model: model ?? null,
+      date: DateTime.now().setZone(DEFAULT_TZ).toISODate(),
+      hour: null,
+      minute: 0,
+      durationMinutes: 60,
+    };
+    schedulerSessions.set(sessionKey, session);
+    setTimeout(() => schedulerSessions.delete(sessionKey), 15 * 60 * 1000);
+    return i.reply({ ephemeral: true, ...buildSchedulerMessage(sessionKey, session) });
   }
   if (name === 'set_fine') {
     if (!i.memberPermissions?.has(PermissionFlagsBits.Administrator))
