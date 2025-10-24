@@ -1,0 +1,21 @@
+{
+  "name": "lumina-bot",
+  "version": "2.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "dev": "node --env-file=.env src/bot.js",
+    "start": "node src/bot.js",
+    "migrate": "node src/db.js migrate",
+    "lint": "echo \"(add eslint later)\""
+  },
+  "dependencies": {
+    "cron-parser": "^5.0.4",
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5",
+    "luxon": "^3.5.0",
+    "node-cron": "^3.0.3",
+    "pino": "^9.3.1",
+    "sqlite3": "^5.1.7"
+  }
+}
